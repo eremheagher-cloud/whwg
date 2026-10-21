@@ -1,0 +1,654 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rdp-state
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  STATE_PASSPHRASE: ${{ secrets.STATE_PASSPHRASE }}
+
+jobs:
+  secure-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    steps:
+      - name: Install save system
+        shell: powershell
+        run: |
+          $code = @'
+          param(
+            [Parameter(Mandatory)][ValidateSet('Save','Restore','Apps')][string]$Action,
+            [string]$User = 'Rafael',
+            [string]$Tag = 'rdp-state',
+            [string[]]$ExtraPaths = @('C:\Apps','C:\Tools')
+          )
+
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $Work = 'C:\state-work'
+          $Repo = $env:GITHUB_REPOSITORY
+          $Pass = $env:STATE_PASSPHRASE
+          $ChunkSize = [int64]1900MB
+
+          if ([string]::IsNullOrWhiteSpace($Pass)) { throw 'Configure o secret STATE_PASSPHRASE.' }
+          New-Item -ItemType Directory -Force $Work | Out-Null
+
+          function Gh([string[]]$a) {
+            $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            $out = & gh @a 2>&1
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = $old
+            [pscustomobject]@{ Code = $code; Out = ($out | Out-String) }
+          }
+
+          function Copy-Tree($Src, $Dst, [string[]]$Opts = @()) {
+            if (-not (Test-Path $Src)) { return }
+            New-Item -ItemType Directory -Force $Dst | Out-Null
+            robocopy $Src $Dst /E /XJ /R:0 /W:0 /NFL /NDL /NJH /NJS /NP @Opts | Out-Null
+            if ($LASTEXITCODE -ge 8) { Write-Host "Aviso: robocopy codigo $LASTEXITCODE em $Src" }
+            $global:LASTEXITCODE = 0
+          }
+
+          function Protect-File($In, $Out) {
+            $salt = New-Object byte[] 16
+            (New-Object Security.Cryptography.RNGCryptoServiceProvider).GetBytes($salt)
+            $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($Pass, $salt, 200000, [Security.Cryptography.HashAlgorithmName]::SHA256)
+            $aes = [Security.Cryptography.Aes]::Create()
+            $aes.Key = $kdf.GetBytes(32); $aes.GenerateIV()
+            $fo = [IO.File]::Create($Out)
+            $fo.Write($salt, 0, 16); $fo.Write($aes.IV, 0, 16)
+            $cs = New-Object Security.Cryptography.CryptoStream($fo, $aes.CreateEncryptor(), 'Write')
+            $fi = [IO.File]::OpenRead($In)
+            $fi.CopyTo($cs, 4MB)
+            $cs.Close(); $fi.Close(); $fo.Close()
+          }
+
+          function Unprotect-File($In, $Out) {
+            $fi = [IO.File]::OpenRead($In)
+            $salt = New-Object byte[] 16; $iv = New-Object byte[] 16
+            [void]$fi.Read($salt, 0, 16); [void]$fi.Read($iv, 0, 16)
+            $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($Pass, $salt, 200000, [Security.Cryptography.HashAlgorithmName]::SHA256)
+            $aes = [Security.Cryptography.Aes]::Create()
+            $aes.Key = $kdf.GetBytes(32); $aes.IV = $iv
+            $cs = New-Object Security.Cryptography.CryptoStream($fi, $aes.CreateDecryptor(), 'Read')
+            $fo = [IO.File]::Create($Out)
+            $cs.CopyTo($fo, 4MB)
+            $fo.Close(); $cs.Close(); $fi.Close()
+          }
+
+          function Split-File($In, $Prefix) {
+            $buf = New-Object byte[] 8MB
+            $fi = [IO.File]::OpenRead($In); $i = 0; $names = @()
+            while ($fi.Position -lt $fi.Length) {
+              $path = '{0}.part{1:000}' -f $Prefix, $i
+              $fo = [IO.File]::Create($path); $written = [int64]0
+              while ($written -lt $ChunkSize -and $fi.Position -lt $fi.Length) {
+                $want = [int][Math]::Min([int64]$buf.Length, $ChunkSize - $written)
+                $n = $fi.Read($buf, 0, $want)
+                $fo.Write($buf, 0, $n); $written += $n
+              }
+              $fo.Close(); $names += (Split-Path $path -Leaf); $i++
+            }
+            $fi.Close()
+            return , $names
+          }
+
+          function Join-Files($Parts, $Out) {
+            $fo = [IO.File]::Create($Out)
+            foreach ($p in $Parts) { $fi = [IO.File]::OpenRead($p); $fi.CopyTo($fo, 8MB); $fi.Close() }
+            $fo.Close()
+          }
+
+          function Get-UserSid { (Get-LocalUser -Name $User).SID.Value }
+
+          function Save-State {
+            if (-not (Test-Path "$Work\ready.flag")) {
+              Write-Host 'Estado anterior nao foi restaurado com sucesso; salvamento ignorado para nao sobrescrever.'
+              return
+            }
+            $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            $S = "$Work\save"; $st = "$S\stage"
+            Remove-Item $S -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force $st | Out-Null
+            $UserDir = "C:\Users\$User"
+            Write-Host "== Salvando estado ($stamp) =="
+
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+              try { winget export -o "$st\winget.json" --accept-source-agreements | Out-Null } catch { Write-Host "winget export falhou: $_" }
+              $global:LASTEXITCODE = 0
+            }
+
+            $sid = Get-UserSid
+            if (Test-Path "Registry::HKEY_USERS\$sid") {
+              reg export "HKU\$sid" "$st\hku.reg" /y | Out-Null
+            } elseif (Test-Path "$UserDir\NTUSER.DAT") {
+              reg load HKU\SaveTmp "$UserDir\NTUSER.DAT" | Out-Null
+              reg export HKU\SaveTmp "$st\hku.reg" /y | Out-Null
+              [gc]::Collect(); Start-Sleep 2
+              reg unload HKU\SaveTmp | Out-Null
+            }
+            reg export HKLM\SOFTWARE\Policies "$st\hklm-policies.reg" /y | Out-Null
+            $global:LASTEXITCODE = 0
+
+            $ex = @('/XF', 'NTUSER.DAT*', 'ntuser.ini', 'UsrClass.dat*',
+                    '/XD', "$UserDir\AppData\Local\Temp", "$UserDir\AppData\Local\Microsoft\Windows\INetCache",
+                    "$UserDir\AppData\Local\CrashDumps", 'Cache', 'Code Cache', 'GPUCache')
+            Copy-Tree $UserDir "$st\profile" $ex
+
+            $extra = @()
+            foreach ($p in $ExtraPaths) {
+              if (Test-Path $p) {
+                $d = ($p -replace '[:\\]', '_')
+                Copy-Tree $p "$st\extra\$d"
+                $extra += [pscustomobject]@{ path = $p; dir = $d }
+              }
+            }
+            ConvertTo-Json -InputObject @($extra) | Set-Content "$st\extra.json"
+
+            tar -czf "$S\state.tar.gz" -C $st .
+            if ($LASTEXITCODE -ne 0) { throw 'Falha ao compactar (tar).' }
+            Remove-Item $st -Recurse -Force
+            Protect-File "$S\state.tar.gz" "$S\state.enc"
+            Remove-Item "$S\state.tar.gz" -Force
+            $parts = Split-File "$S\state.enc" "$S\state-$stamp"
+            Remove-Item "$S\state.enc" -Force
+            $mb = [math]::Round((($parts | ForEach-Object { (Get-Item "$S\$_").Length } | Measure-Object -Sum).Sum) / 1MB)
+            Write-Host "Pacote: $($parts.Count) parte(s), $mb MB"
+
+            $r = Gh @('release', 'view', $Tag, '--repo', $Repo)
+            if ($r.Code -ne 0) {
+              $c = Gh @('release', 'create', $Tag, '--repo', $Repo, '--title', 'Estado do RDP', '--notes', 'Estado criptografado do RDP. Nao apague.')
+              if ($c.Code -ne 0) { throw $c.Out }
+            }
+            $files = @($parts | ForEach-Object { "$S\$_" })
+            $u = Gh (@('release', 'upload', $Tag, '--repo', $Repo, '--clobber') + $files)
+            if ($u.Code -ne 0) { throw $u.Out }
+
+            @{ stamp = $stamp; parts = @($parts) } | ConvertTo-Json | Set-Content "$S\manifest.json"
+            $u = Gh @('release', 'upload', $Tag, '--repo', $Repo, '--clobber', "$S\manifest.json")
+            if ($u.Code -ne 0) { throw $u.Out }
+
+            $l = Gh @('release', 'view', $Tag, '--repo', $Repo, '--json', 'assets', '-q', '.assets[].name')
+            $keep = @($parts) + 'manifest.json'
+            foreach ($n in ($l.Out -split '\r?\n' | Where-Object { $_ })) {
+              if ($keep -notcontains $n) { [void](Gh @('release', 'delete-asset', $Tag, $n, '--repo', $Repo, '-y')) }
+            }
+            Remove-Item $S -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host '== Estado salvo com sucesso =='
+          }
+
+          function Restore-State {
+            $R = "$Work\restore"
+            Remove-Item $R -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force "$R\stage" | Out-Null
+
+            $l = Gh @('release', 'view', $Tag, '--repo', $Repo, '--json', 'assets', '-q', '.assets[].name')
+            if ($l.Code -ne 0 -or ($l.Out -split '\r?\n') -notcontains 'manifest.json') {
+              Write-Host 'Nenhum estado salvo ainda (primeira execucao).'
+              New-Item "$Work\ready.flag" -Force | Out-Null
+              return
+            }
+
+            Write-Host '== Restaurando estado =='
+            $d = Gh @('release', 'download', $Tag, '--repo', $Repo, '-p', 'manifest.json', '-D', $R, '--clobber')
+            if ($d.Code -ne 0) { throw $d.Out }
+            $m = Get-Content "$R\manifest.json" -Raw | ConvertFrom-Json
+            foreach ($p in @($m.parts)) {
+              $d = Gh @('release', 'download', $Tag, '--repo', $Repo, '-p', $p, '-D', $R, '--clobber')
+              if ($d.Code -ne 0) { throw $d.Out }
+            }
+            Join-Files (@($m.parts) | ForEach-Object { "$R\$_" }) "$R\state.enc"
+            Unprotect-File "$R\state.enc" "$R\state.tar.gz"
+            Remove-Item "$R\state.enc", "$R\*.part*" -Force
+            tar -xzf "$R\state.tar.gz" -C "$R\stage"
+            if ($LASTEXITCODE -ne 0) { throw 'Falha ao extrair (tar). Passphrase incorreta?' }
+            Remove-Item "$R\state.tar.gz" -Force
+            $st = "$R\stage"
+
+            if (-not ('UP' -as [type])) {
+              Add-Type -TypeDefinition 'using System; using System.Text; using System.Runtime.InteropServices; public static class UP { [DllImport("userenv.dll", CharSet=CharSet.Unicode)] public static extern int CreateProfile(string sid, string user, StringBuilder path, uint size); }'
+            }
+            $sb = New-Object Text.StringBuilder 260
+            $hr = [UP]::CreateProfile((Get-UserSid), $User, $sb, 260)
+            if ($hr -ne 0 -and $hr -ne -2147024713) { throw "CreateProfile falhou: $hr" }
+            $UserDir = if ($sb.Length) { $sb.ToString() } else { "C:\Users\$User" }
+
+            Copy-Tree "$st\profile" $UserDir
+
+            if (Test-Path "$st\hku.reg") {
+              reg load HKU\RestoreTmp "$UserDir\NTUSER.DAT" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw 'Nao consegui carregar o NTUSER.DAT.' }
+              try {
+                $txt = Get-Content "$st\hku.reg" -Raw
+                $txt = [regex]::Replace($txt, '(?im)^(\[-?)HKEY_USERS\\[^\\\]]+', '${1}HKEY_USERS\RestoreTmp')
+                Set-Content "$st\hku-fixed.reg" $txt -Encoding Unicode
+                reg import "$st\hku-fixed.reg" | Out-Null
+              } finally {
+                [gc]::Collect(); Start-Sleep 2
+                reg unload HKU\RestoreTmp | Out-Null
+              }
+            }
+            if (Test-Path "$st\hklm-policies.reg") { reg import "$st\hklm-policies.reg" | Out-Null }
+            $global:LASTEXITCODE = 0
+
+            if (Test-Path "$st\extra.json") {
+              foreach ($e in @(Get-Content "$st\extra.json" -Raw | ConvertFrom-Json)) {
+                Copy-Tree "$st\extra\$($e.dir)" $e.path
+              }
+            }
+
+            New-Item "$Work\ready.flag" -Force | Out-Null
+            Write-Host '== Estado restaurado =='
+          }
+
+          function Install-Apps {
+            $f = "$Work\restore\stage\winget.json"
+            if (-not (Test-Path $f)) { Write-Host 'Sem lista de apps para reinstalar.'; return }
+            Write-Host '== Reinstalando apps do winget =='
+            winget import -i $f --accept-package-agreements --accept-source-agreements --ignore-unavailable --disable-interactivity
+            $global:LASTEXITCODE = 0
+          }
+
+          switch ($Action) {
+            'Save'    { Save-State }
+            'Restore' { Restore-State }
+            'Apps'    { Install-Apps }
+          }
+          '@
+          Set-Content -Path C:\state.ps1 -Value $code -Encoding UTF8      - name: Start save clock
+        shell: powershell
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:STATE_PASSPHRASE)) {
+            throw "Configure o secret STATE_PASSPHRASE nos secrets do repositorio."
+          }
+          "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
+
+      - name: Show Windows and Hardware Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "========== WINDOWS 11 ARM64 =========="
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor
+
+          $os | Select-Object Caption, Version, BuildNumber, OSArchitecture | Format-List
+
+          $cpu | Select-Object Name, Architecture, NumberOfCores, NumberOfLogicalProcessors | Format-List
+
+          $total = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+          $free = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+
+          Write-Host "RAM total: $total GB"
+          Write-Host "RAM disponivel: $free GB"
+          Write-Host "RAM em uso: $([math]::Round($total - $free, 2)) GB"
+          Write-Host "Arquitetura reportada pelo Windows: $($os.OSArchitecture)"
+          Write-Host "======================================"
+
+          if ([version]$os.Version -lt [version]"10.0") {
+            throw "A versao detectada do Windows e incompativel com o Tailscale atual."
+          }
+
+          if ($os.Caption -notmatch "Windows 11") {
+            throw "O runner nao esta reportando Windows 11. Verifique a imagem real do runner."
+          }
+
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Force
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+
+          New-NetFirewallRule -DisplayName 'RDP-Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Profile Any
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "Configuracao RDP concluida."
+
+      - name: Create Windows Account Rafael
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "Rafael"
+          $plainPassword = "yyyy-MM-dd"
+
+          $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+
+          $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+            New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires -ErrorAction Stop | Out-Null
+          }
+          else {
+            Set-LocalUser -Name $username -Password $securePassword -ErrorAction Stop
+          }
+
+          $userSid = (Get-LocalUser -Name $username).SID.Value
+
+          foreach ($group in @("Administrators", "Remote Desktop Users")) {
+            $members = Get-LocalGroupMember -Group $group -ErrorAction Stop
+
+            $isMember = $members | Where-Object { $_.SID.Value -eq $userSid }
+
+            if (-not $isMember) {
+              Add-LocalGroupMember -Group $group -Member $username -ErrorAction Stop
+            }
+          }
+
+          Write-Host "Conta Windows: Rafael"
+          Write-Host "Senha configurada."
+          Write-Host "Conta adicionada aos grupos necessarios."
+
+      - name: Prepare Windows Services for Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredServices = @(
+            "Dnscache",
+            "iphlpsvc",
+            "netprofm",
+            "WinHttpAutoProxySvc"
+          )
+
+          foreach ($serviceName in $requiredServices) {
+            $service = Get-Service -Name $serviceName -ErrorAction Stop
+
+            Write-Host "Verificando servico: $serviceName"
+
+            if ($service.StartType -eq "Disabled") {
+              Set-Service -Name $serviceName -StartupType Manual
+            }
+
+            $service = Get-Service -Name $serviceName
+
+            if ($service.Status -ne "Running") {
+              Start-Service -Name $serviceName
+            }
+
+            $service = Get-Service -Name $serviceName
+
+            if ($service.Status -ne "Running") {
+              throw "O servico $serviceName nao esta funcionando."
+            }
+
+            Write-Host "$serviceName esta funcionando."
+          }
+
+      - name: Install Tailscale ARM64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $installerPath = Join-Path $env:TEMP 'tailscale-arm64.msi'
+          $logPath = Join-Path $env:TEMP 'tailscale-install.log'
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          $tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi'
+
+          # Reutiliza uma instalacao funcional.
+          if (Test-Path $tsExe) {
+            Write-Host 'Tailscale ja esta instalado.'
+            & $tsExe version
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host 'Instalacao existente validada.'
+              exit 0
+            }
+          }
+
+          try {
+            Write-Host 'Baixando o MSI ARM64 oficial do Tailscale...'
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+
+            if (-not (Test-Path $installerPath)) {
+              throw 'O instalador ARM64 nao foi baixado.'
+            }
+
+            if ((Get-Item $installerPath).Length -lt 1000000) {
+              throw 'O arquivo baixado esta incompleto ou e invalido.'
+            }
+
+            Write-Host 'Iniciando instalacao silenciosa...'
+            Write-Host "Log detalhado: $logPath"
+
+            $msiArgs = @(
+              '/i',
+              ('"{0}"' -f $installerPath),
+              '/qn',
+              '/norestart',
+              '/L*V',
+              ('"{0}"' -f $logPath),
+              'TS_NOLAUNCH=1',
+              'TS_UNATTENDEDMODE=always'
+            )
+
+            $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $msiArgs -Wait -PassThru
+
+            Write-Host "Codigo de saida: $($process.ExitCode)"
+
+            if ($process.ExitCode -notin @(0, 3010)) {
+              if (Test-Path $logPath) {
+                Write-Host 'Possiveis causas da falha no MSI:'
+                $pattern = 'Return value 3|Error 1603|Installation failed|LaunchCondition'
+                Select-String -Path $logPath -Pattern $pattern -Context 5, 10 |
+                  Select-Object -Last 20 |
+                  ForEach-Object {
+                    Write-Host $_.ToString()
+                    $_.Context.PreContext | ForEach-Object { Write-Host $_ }
+                    $_.Context.PostContext | ForEach-Object { Write-Host $_ }
+                  }
+              }
+
+              throw "A instalacao do Tailscale falhou: codigo $($process.ExitCode)."
+            }
+
+            $deadline = (Get-Date).AddSeconds(30)
+
+            while (-not (Test-Path $tsExe) -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 2
+            }
+
+            if (-not (Test-Path $tsExe)) {
+              throw "A instalacao terminou, mas tailscale.exe nao foi encontrado em $tsExe."
+            }
+
+            & $tsExe version
+
+            if ($LASTEXITCODE -ne 0) {
+              throw 'O executavel do Tailscale nao iniciou corretamente.'
+            }
+
+            Write-Host 'Tailscale ARM64 instalado e validado.'
+          }
+          finally {
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          }      - name: Restore saved state
+        shell: powershell
+        run: C:\state.ps1 -Action Restore
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Configure TAILSCALE_AUTH_KEY nos secrets do repositorio."
+          }
+
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tsExe)) {
+            throw "Tailscale nao encontrado: $tsExe"
+          }
+
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          Write-Host "Conectando ao Tailscale..."
+          Write-Host "Hostname: $hostname"
+
+          & $tsExe up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=$hostname" "--unattended=true" "--timeout=120s"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao conectar ao Tailscale. Codigo: $LASTEXITCODE"
+          }
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 30 -and -not $tsIP; $i++) {
+            Start-Sleep -Seconds 5
+
+            $ips = & $tsExe ip -4
+
+            if ($LASTEXITCODE -eq 0 -and $ips) {
+              $candidateIP = ($ips | Select-Object -First 1).Trim()
+
+              if ($candidateIP -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                $tsIP = $candidateIP
+              }
+            }
+          }
+
+          if (-not $tsIP) {
+            & $tsExe status
+            throw "O Tailscale nao atribuiu um endereco IPv4."
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Endereco Tailscale: $tsIP"
+          Write-Host "Hostname: $hostname"
+
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Endereco Tailscale: $env:TAILSCALE_IP"
+
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name TermService
+          }
+
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+            throw "O servico RDP nao esta ativo."
+          }
+
+          $listener = Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            throw "A porta TCP 3389 nao esta em escuta."
+          }
+
+          Write-Host "Servico RDP ativo."
+          Write-Host "Porta TCP 3389 em escuta."
+
+          Write-Host ""
+          Write-Host "========== ACESSO RDP =========="
+          Write-Host "Endereco: $env:TAILSCALE_IP"
+          Write-Host "Usuario: Rafael"
+          Write-Host "Senha: yyyy-MM-dd"
+          Write-Host "Porta: 3389"
+          Write-Host "================================"
+          Write-Host ""
+
+      - name: Reinstall saved apps
+        continue-on-error: true
+        shell: powershell
+        run: C:\state.ps1 -Action Apps
+
+      - name: Maintain Connection
+        shell: powershell
+        env:
+          AUTOSAVE_MIN: "30"
+          END_AFTER_MIN: "330"
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "========== ACESSO RDP =========="
+          Write-Host "Endereco: $env:TAILSCALE_IP"
+          Write-Host "Usuario: Rafael"
+          Write-Host "Senha: yyyy-MM-dd"
+          Write-Host "Porta: 3389"
+          Write-Host "Salvar agora: crie o arquivo C:\save-now.flag"
+          Write-Host "Salvar e encerrar: crie o arquivo C:\stop-now.flag"
+          Write-Host "================================"
+          Write-Host ""
+
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          $deadline = [DateTimeOffset]::FromUnixTimeSeconds([int64]$env:JOB_START).AddMinutes([int]$env:END_AFTER_MIN)
+          $lastSave = Get-Date
+          $lastStatus = (Get-Date).AddMinutes(-10)
+
+          function Do-Save {
+            try { & C:\state.ps1 -Action Save }
+            catch { Write-Host "Aviso: falha ao salvar: $_" }
+          }
+
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            $rdpService = Get-Service -Name TermService
+
+            if ($rdpService.Status -ne "Running") {
+              Start-Service -Name TermService
+            }
+
+            if (Test-Path 'C:\stop-now.flag') {
+              Remove-Item 'C:\stop-now.flag' -Force
+              Write-Host "stop-now detectado."
+              break
+            }
+
+            if (Test-Path 'C:\save-now.flag') {
+              Remove-Item 'C:\save-now.flag' -Force
+              Do-Save
+              $lastSave = Get-Date
+            }
+            elseif (((Get-Date) - $lastSave).TotalMinutes -ge [int]$env:AUTOSAVE_MIN) {
+              Do-Save
+              $lastSave = Get-Date
+            }
+
+            if (((Get-Date) - $lastStatus).TotalMinutes -ge 5) {
+              if (Test-Path $tsExe) {
+                & $tsExe status
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Host "Aviso: verifique o estado da conexao Tailscale."
+                }
+              }
+
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Verificacao concluida."
+              $lastStatus = Get-Date
+            }
+
+            Start-Sleep -Seconds 20
+          }
+
+          Write-Host "Encerrando para o salvamento final."
+
+      - name: Final save
+        if: ${{ always() }}
+        shell: powershell
+        run: C:\state.ps1 -Action Save
